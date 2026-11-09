@@ -1,0 +1,9 @@
+node_modules/
+out/
+tmp_audio/
+job.json
+props.json
+errors.txt
+fail.txt
+render.log
+public/voice.mp3

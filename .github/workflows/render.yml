@@ -1,0 +1,90 @@
+name: render
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "JSON del video (code + scenes) codificato in base64"
+        required: true
+      callback:
+        description: "Indirizzo n8n a cui inviare il video (resumeUrl del nodo Wait)"
+        required: true
+
+# Il codice del video è scritto da un'AI: il job non riceve nessun permesso sul repository.
+permissions: {}
+
+concurrency:
+  group: render
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      JOB: ${{ inputs.job }}
+      CALLBACK: ${{ inputs.callback }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installa dipendenze
+        run: |
+          npm ci --no-audit --no-fund
+          pip install edge-tts==7.3.1
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null
+          npx remotion browser ensure
+
+      - name: Prepara codice e voce
+        run: |
+          printf '%s' "$JOB" | base64 -d > job.json
+          python scripts/prepare.py
+
+      - name: Renderizza
+        run: |
+          set -o pipefail
+          mkdir -p out
+          npx remotion render src/index.ts Video out/video.mp4 \
+            --props=props.json --codec=h264 --crf=23 --audio-codec=aac \
+            --concurrency=2 2>&1 | tee render.log
+
+      - name: Comprimi se supera 9,5 MB
+        run: |
+          SIZE=$(stat -c%s out/video.mp4)
+          if [ "$SIZE" -gt 9961472 ]; then
+            DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 out/video.mp4)
+            KBPS=$(python -c "print(int(9.0*8*1024/$DUR - 160))")
+            ffmpeg -y -loglevel error -i out/video.mp4 -c:v libx264 -preset medium -b:v ${KBPS}k \
+              -maxrate ${KBPS}k -bufsize $((KBPS*2))k -pix_fmt yuv420p -c:a aac -b:a 128k \
+              -movflags +faststart out/small.mp4
+            mv out/small.mp4 out/video.mp4
+          fi
+          ls -la out/video.mp4
+
+      - name: Invia il video a n8n
+        run: |
+          curl -sS --fail --retry 3 -X POST "$CALLBACK" \
+            -F "ok=true" \
+            -F "run=${{ github.run_id }}" \
+            -F "video=@out/video.mp4;type=video/mp4"
+
+      - name: Invia l'errore a n8n
+        if: failure()
+        run: |
+          {
+            [ -f errors.txt ] && cat errors.txt
+            [ -f render.log ] && grep -iE "error|cannot|undefined|unexpected|not defined|is not|failed" render.log | grep -v "^ *at " | head -40
+          } > fail.txt || true
+          [ -s fail.txt ] || echo "Errore generico nel render (vedi run ${{ github.run_id }})" > fail.txt
+          curl -sS --retry 3 -X POST "$CALLBACK" \
+            -F "ok=false" \
+            -F "run=${{ github.run_id }}" \
+            -F "error=<fail.txt"
